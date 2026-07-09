@@ -1,7 +1,7 @@
 <Project>
 
   <!--
-    FullHouse.props - shared "raise the co-op lobby cap" engine (namespace DooDesch.Lobbies) for
+    FullHouse.props - shared "raise the co-op lobby cap" engine (namespace DooDesch.FullHouse) for
     Schedule I MelonLoader mods. Lives in the public Stash repo (github.com/DooDesch-Mods/ScheduleOne-Stash).
 
     A mod opts in with EXACTLY ONE line - IMPORTANT: place it AFTER the mod's <Compile Remove="Stash/**/*.cs" />
@@ -10,7 +10,7 @@
         <Import Project="$(MSBuildThisFileDirectory)../Stash/build/FullHouse.props"
                 Condition="Exists('$(MSBuildThisFileDirectory)../Stash/build/FullHouse.props')" />
 
-    Usage in the host mod: call DooDesch.Lobbies.FullHouse.Install() once, early (e.g. OnInitializeMelon).
+    Usage in the host mod: call DooDesch.FullHouse.Lobbies.Install() once, early (e.g. OnInitializeMelon).
     That raises the cap natively - no external BiggerLobbies dependency. Coexists with other cap mods
     (highest cap wins) and a runtime single-flight guard prevents double-patching if the standalone
     FullHouse.dll is also loaded.

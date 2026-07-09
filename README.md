@@ -28,7 +28,7 @@ A host mod adds one line to its `.csproj` (after its `<Compile Remove>` guards) 
         Condition="Exists('$(MSBuildThisFileDirectory)../Stash/build/FullHouse.props')" />
 ```
 ```csharp
-DooDesch.Lobbies.FullHouse.Install();   // early, e.g. OnInitializeMelon
+DooDesch.FullHouse.Lobbies.Install();   // early, e.g. OnInitializeMelon
 ```
 
 The engine is `internal`, so several mods can each compile it in without a CS0436 clash, and a runtime

@@ -40,23 +40,23 @@ using UnityEngine;
 using UnityEngine.UI;
 
 #if FULLHOUSE_STANDALONE
-[assembly: MelonInfo(typeof(DooDesch.Lobbies.Core), "FullHouse", "1.0.0", "DooDesch", "https://github.com/DooDesch-Mods/ScheduleOne-FullHouse")]
+[assembly: MelonInfo(typeof(DooDesch.FullHouse.Core), "FullHouse", "1.0.0", "DooDesch", "https://github.com/DooDesch-Mods/ScheduleOne-FullHouse")]
 [assembly: MelonGame("TVGS", "Schedule I")]
 #endif
 
-namespace DooDesch.Lobbies
+namespace DooDesch.FullHouse
 {
 #if FULLHOUSE_STANDALONE
     /// <summary>Standalone MelonMod entry. Compiled only into the standalone FullHouse.dll; excluded when the
-    /// engine is embedded as linked source into a host mod (which calls <see cref="FullHouse.Install"/> itself).</summary>
+    /// engine is embedded as linked source into a host mod (which calls <see cref="Lobbies.Install"/> itself).</summary>
     public sealed class Core : MelonMod
     {
-        public override void OnInitializeMelon() => FullHouse.Install();
+        public override void OnInitializeMelon() => Lobbies.Install();
     }
 #endif
 
     /// <summary>The cap-raising engine. Call <see cref="Install"/> once (early - e.g. OnInitializeMelon).</summary>
-    internal static class FullHouse
+    internal static class Lobbies
     {
         internal const int DefaultCapacity = 32;
         private const int HardMax = 250;   // Steam's absolute lobby member ceiling
@@ -147,7 +147,7 @@ namespace DooDesch.Lobbies
         }
 
         private static HarmonyMethod Hook(string name) =>
-            name == null ? null : new HarmonyMethod(typeof(FullHouse).GetMethod(name, AccessTools.all));
+            name == null ? null : new HarmonyMethod(typeof(Lobbies).GetMethod(name, AccessTools.all));
 
         // ---- seat array + Steam member limit ------------------------------------------------------------
 
@@ -218,7 +218,7 @@ namespace DooDesch.Lobbies
         /// with another cap mod's prefix instead of double-handling the invite.</summary>
         private static IEnumerable<CodeInstruction> CapLiteralTranspiler(IEnumerable<CodeInstruction> instructions)
         {
-            var capField = AccessTools.Field(typeof(FullHouse), nameof(PatchCap));
+            var capField = AccessTools.Field(typeof(Lobbies), nameof(PatchCap));
             foreach (var ins in instructions)
             {
                 if (ins.opcode == OpCodes.Ldc_I4_4)
