@@ -1,0 +1,18 @@
+# Game/MelonLoader DLLs copied in for local builds - NEVER commit these (they are TVGS/third-party binaries).
+lib/
+
+# Build output
+bin/
+obj/
+
+# IDE
+.vs/
+*.user
+*.suo
+
+# Agent / local
+.claude/
+
+# OS
+Thumbs.db
+.DS_Store
