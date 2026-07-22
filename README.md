@@ -1,6 +1,6 @@
 # Stash - shared source for DooDesch's Schedule I mods
 
-> 🛟 **Need help or found a bug?** Get support at [support.doodesch.de](https://support.doodesch.de).
+> 🛟 **Need help or found a bug?** Get support at [support.doodesch.de/stash](https://support.doodesch.de/stash).
 
 The **Stash** is the public, MIT-licensed source that several DooDesch Schedule I mods share. It exists so the
 actual mod logic lives in the open - some mods (like [FullHouse](https://github.com/DooDesch-Mods/ScheduleOne-FullHouse))
