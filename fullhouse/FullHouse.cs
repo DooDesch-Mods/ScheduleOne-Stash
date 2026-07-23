@@ -133,17 +133,18 @@ namespace DooDesch.FullHouse
                 Patch(h, typeof(Lobby), "TryOpenInviteInterface", transpiler: nameof(CapLiteralTranspiler));
                 Patch(h, typeof(LobbyInterface), "UpdateButtons", transpiler: nameof(CapLiteralTranspiler));
                 Patch(h, typeof(LobbyInterface), "Awake", postfix: nameof(LobbyInterface_Awake_Postfix));
+                Patch(h, typeof(LobbyInterface), "UpdatePlayers", prefix: nameof(LobbyInterface_UpdatePlayers_Prefix));
                 MelonLogger.Msg($"[FullHouse] active - lobby cap raised to {PatchCap}.");
             }
             catch (Exception e) { MelonLogger.Error("[FullHouse] patch install failed: " + e); }
         }
 
         private static void Patch(HarmonyLib.Harmony h, Type type, string method,
-            string postfix = null, string transpiler = null)
+            string prefix = null, string postfix = null, string transpiler = null)
         {
             var target = AccessTools.Method(type, method);
             if (target == null) { MelonLogger.Warning($"[FullHouse] {type.Name}.{method} not found - skipped."); return; }
-            h.Patch(target, postfix: Hook(postfix), transpiler: Hook(transpiler));
+            h.Patch(target, prefix: Hook(prefix), postfix: Hook(postfix), transpiler: Hook(transpiler));
         }
 
         private static HarmonyMethod Hook(string name) =>
@@ -181,8 +182,13 @@ namespace DooDesch.FullHouse
                 int cap = Capacity;
                 if (SteamMatchmaking.GetLobbyMemberLimit(sid) < cap)
                     SteamMatchmaking.SetLobbyMemberLimit(sid, cap);
-                SteamMatchmaking.SetLobbyData(sid, "max_players", cap.ToString());
-                SteamMatchmaking.SetLobbyData(sid, "num_slots", cap.ToString());
+                // Advertise the limit Steam actually accepted, not the requested one: if SetLobbyMemberLimit was
+                // rejected (host not owner yet, Steam not ready) the real lobby stays smaller, and telling clients a
+                // larger cap would let them grow their seats and invite for seats Steam then refuses to fill.
+                int real = SteamMatchmaking.GetLobbyMemberLimit(sid);
+                if (real < cap) MelonLogger.Warning($"[FullHouse] Steam kept the lobby member limit at {real} (requested {cap}); advertising {real}.");
+                SteamMatchmaking.SetLobbyData(sid, "max_players", real.ToString());
+                SteamMatchmaking.SetLobbyData(sid, "num_slots", real.ToString());
             }
             catch (Exception e) { MelonLogger.Warning("[FullHouse] OnLobbyCreated failed: " + e.Message); }
         }
@@ -236,6 +242,32 @@ namespace DooDesch.FullHouse
             catch (Exception e) { MelonLogger.Warning("[FullHouse] UI coroutine start failed: " + e.Message); }
         }
 
+        /// <summary>Vanilla UpdatePlayers loops <c>for i in 0..PlayerSlots.Length</c> and indexes
+        /// <c>Lobby.Players[i]</c>. Once the UI slots are grown to the cap, a join/rejoin that momentarily leaves the
+        /// seat array at the vanilla size 4 (the game reallocates it on some member changes) makes that index
+        /// overflow and throws an IndexOutOfRangeException on the IL2CPP trampoline - taking down the whole session.
+        /// Guarantee the seat array is at least as large as the UI before the vanilla loop runs. Idempotent (grows
+        /// only), and the extra slots read as CSteamID.Nil so vanilla just clears them.</summary>
+        private static void LobbyInterface_UpdatePlayers_Prefix(LobbyInterface __instance)
+        {
+            try
+            {
+                if (__instance?.PlayerSlots == null) return;
+                // Vanilla indexes __instance.Lobby.Players (the interface's OWN field), not the Lobby singleton, so
+                // grow exactly that array. They are normally the same object, but a stale UI instance during a
+                // leave/rejoin can still hold a lobby the singleton no longer points at (or the singleton is null);
+                // growing the singleton would then leave vanilla overflowing the array it actually reads.
+                var lobby = __instance.Lobby ?? Singleton<Lobby>.Instance;
+                if (lobby?.Players == null) return;
+                if (lobby.Players.Length < __instance.PlayerSlots.Length)
+                    GrowPlayers(lobby, __instance.PlayerSlots.Length);
+            }
+            catch (Exception e) { MelonLogger.Warning("[FullHouse] UpdatePlayers guard failed: " + e.Message); }
+        }
+
+        // Set once: the Lobby singleton persists across scenes, so its onLobbyChange must be wrapped a single time.
+        private static bool _titleHooked;
+
         /// <summary>Wait for the Lobby singleton, defensively grow the seat array, then clone the lobby's slot
         /// template up to <c>cap</c> TOTAL slots (counting whatever is already there, so it never double-clones when
         /// another cap mod added some), rebuild PlayerSlots, and set the "/cap" title.</summary>
@@ -252,26 +284,32 @@ namespace DooDesch.FullHouse
 
             EnsureSlots(ui, EffectiveCap);
 
-            // Vanilla re-sets the title to ".../4" on every lobby change; wrap onLobbyChange to re-apply the
-            // effective cap after. It reads EffectiveCap live, so a later host-cap sync corrects the title too.
-            try
+            // Vanilla re-sets the title to ".../4" on every lobby change; wrap onLobbyChange ONCE to re-apply the
+            // effective cap after. The Lobby is a persistent singleton that survives scene reloads, so a per-Awake
+            // re-wrap would chain wrappers that pile up and reference destroyed UI; the single hook instead resolves
+            // the live LobbyInterface each time and reads EffectiveCap live, so a later host-cap sync corrects it too.
+            if (!_titleHooked)
             {
-                var prev = lobby.onLobbyChange;
+                _titleHooked = true;
+                try
+                {
+                    var prev = lobby.onLobbyChange;
 #if IL2CPP
-                lobby.onLobbyChange = new System.Action(() =>
-                {
-                    try { prev?.Invoke(); } catch { }
-                    try { ui.LobbyTitle.text = "Lobby (" + lobby.PlayerCount + "/" + EffectiveCap + ")"; } catch { }
-                });
+                    lobby.onLobbyChange = new System.Action(() =>
+                    {
+                        try { prev?.Invoke(); } catch { }
+                        try { var cur = Singleton<LobbyInterface>.Instance; if (cur != null) cur.LobbyTitle.text = "Lobby (" + lobby.PlayerCount + "/" + EffectiveCap + ")"; } catch { }
+                    });
 #else
-                lobby.onLobbyChange = () =>
-                {
-                    try { prev?.Invoke(); } catch { }
-                    try { ui.LobbyTitle.text = "Lobby (" + lobby.PlayerCount + "/" + EffectiveCap + ")"; } catch { }
-                };
+                    lobby.onLobbyChange = () =>
+                    {
+                        try { prev?.Invoke(); } catch { }
+                        try { var cur = Singleton<LobbyInterface>.Instance; if (cur != null) cur.LobbyTitle.text = "Lobby (" + lobby.PlayerCount + "/" + EffectiveCap + ")"; } catch { }
+                    };
 #endif
+                }
+                catch (Exception e) { _titleHooked = false; MelonLogger.Warning("[FullHouse] title sync hook failed: " + e.Message); }
             }
-            catch (Exception e) { MelonLogger.Warning("[FullHouse] title sync hook failed: " + e.Message); }
         }
 
         /// <summary>Clone the lobby slot template up to <paramref name="target"/> TOTAL slots (counting whatever is
@@ -307,6 +345,17 @@ namespace DooDesch.FullHouse
                 var lobby = Singleton<Lobby>.Instance;
                 int count = lobby != null ? lobby.PlayerCount : 0;
                 ui.LobbyTitle.text = "Lobby (" + count + "/" + target + ")";
+
+                // A freshly-cloned slot defaults to ACTIVE. Vanilla only hides an empty seat inside UpdatePlayers
+                // (ClearPlayer -> SetActive(false)), and that only re-runs on a lobby change - so when the panel opens
+                // with members already seated, the new empty clones would linger as a blank strip across the top.
+                // Refresh once now; the Players array was grown first (BuildUi + the UpdatePlayers prefix), so the
+                // vanilla loop covers every slot instead of overflowing at index 4 and leaving the rest visible.
+#if IL2CPP
+                try { ui.UpdatePlayers(); } catch { }
+#else
+                try { AccessTools.Method(typeof(LobbyInterface), "UpdatePlayers")?.Invoke(ui, null); } catch { }
+#endif
             }
             catch (Exception e) { MelonLogger.Warning("[FullHouse] building lobby UI failed: " + e.Message); }
         }
