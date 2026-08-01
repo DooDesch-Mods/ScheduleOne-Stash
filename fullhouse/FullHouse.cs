@@ -293,15 +293,15 @@ namespace DooDesch.FullHouse
                 _titleHooked = true;
                 try
                 {
-                    var prev = lobby.onLobbyChange;
+                    var prev = lobby.OnLobbyChange;
 #if IL2CPP
-                    lobby.onLobbyChange = new System.Action(() =>
+                    lobby.OnLobbyChange = new System.Action(() =>
                     {
                         try { prev?.Invoke(); } catch { }
                         try { var cur = Singleton<LobbyInterface>.Instance; if (cur != null) cur.LobbyTitle.text = "Lobby (" + lobby.PlayerCount + "/" + EffectiveCap + ")"; } catch { }
                     });
 #else
-                    lobby.onLobbyChange = () =>
+                    lobby.OnLobbyChange = () =>
                     {
                         try { prev?.Invoke(); } catch { }
                         try { var cur = Singleton<LobbyInterface>.Instance; if (cur != null) cur.LobbyTitle.text = "Lobby (" + lobby.PlayerCount + "/" + EffectiveCap + ")"; } catch { }
