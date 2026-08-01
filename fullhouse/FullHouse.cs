@@ -6,15 +6,21 @@
 //   * Embedded: linked as source into another mod (e.g. SideHustle via Workspace/build/FullHouse.props);
 //     the host calls FullHouse.Install() and gets native bigger lobbies with no external dependency.
 //
-// It targets the game's own Lobby / LobbyInterface (never the Steam API), following the SOTA recipe in
-// Workspace/docs/MultiplayerCap/SOTA-MAX-PLAYERS.md:
-//   - resize the fixed Lobby.Players[4] array (the client-side seat store),
-//   - raise the Steam member limit post-creation via SetLobbyMemberLimit (never replace CreateLobby),
-//   - raise the invite gate by transpiling the single literal 4 -> the configured cap,
-//   - clone the lobby UI slots and keep the "/N" title in sync.
+// Since 0.4.6f11 the game hides Steam behind ScheduleOne.Networking.ILobbyService: Lobby owns no callbacks,
+// no seat array and no Steam id any more, it delegates to SteamLobbyService (or MockLobbyService when Steam
+// is down). So every patch below targets SteamLobbyService and LobbyInterface:
+//   - grow the fixed SteamLobbyService._players[4] seat store (UpdateLobbyMembers writes into it with no
+//     bounds check, so member #5 would throw IndexOutOfRange inside a Steam callback),
+//   - raise the requested member count in CreateLobby and again post-creation via SetLobbyMemberLimit,
+//   - replace the invite gate, whose "already at max capacity" check is a hard-coded 4,
+//   - clone the lobby UI slots and keep the "/N" title and the invite button in sync.
 // All patches are idempotent and additive (only ever grow, never skip the original), so it coexists with
 // other cap mods (e.g. BiggerLobbies): the highest cap wins and nothing conflicts. A named-GameObject
 // single-flight guard means only one loaded copy installs the patches.
+//
+// NOTE for future edits: transpilers are useless here. Under MelonLoader/IL2CPP a Harmony patch detours the
+// native method pointer; there is no managed IL body to rewrite, so a literal-replacing transpiler silently
+// does nothing. Every cap literal must be handled by a prefix or postfix.
 //
 // The class is INTERNAL so it can be compiled into several assemblies without a CS0436 clash.
 
@@ -24,6 +30,7 @@ using Il2CppScheduleOne.UI.Multiplayer;
 using Il2CppScheduleOne.DevUtilities;
 using Il2CppSteamworks;
 using Il2Cpp;                       // SteamManager (global-namespace Steamworks.NET helper)
+using Il2CppInterop.Runtime.InteropTypes.Arrays;
 #else
 using ScheduleOne.Networking;
 using ScheduleOne.UI.Multiplayer;
@@ -33,11 +40,9 @@ using Steamworks;
 using System;
 using System.Collections;
 using System.Collections.Generic;
-using System.Reflection.Emit;
 using HarmonyLib;
 using MelonLoader;
 using UnityEngine;
-using UnityEngine.UI;
 
 #if FULLHOUSE_STANDALONE
 [assembly: MelonInfo(typeof(DooDesch.FullHouse.Core), "FullHouse", "1.0.0", "DooDesch", "https://github.com/DooDesch-Mods/ScheduleOne-FullHouse")]
@@ -78,17 +83,36 @@ namespace DooDesch.FullHouse
             }
         }
 
-        /// <summary>Backing value the invite-gate transpiler loads (Ldsfld) in place of the literal 4. Must be a
-        /// field, not a property, so the transpiler can emit a direct field load. Tracks <see cref="EffectiveCap"/>.</summary>
-        internal static int PatchCap = DefaultCapacity;
-
         /// <summary>The host's advertised cap, learned from the lobby's "max_players" data when we join. Lets a
         /// client configured smaller than the host still seat everyone the host admits. Only ever grows.</summary>
         private static int _hostCap;
 
         /// <summary>The cap actually applied on this client - the larger of our own setting and the host's, clamped
-        /// to the hard ceiling. This is what the array, invite gate and UI use, so a client adapts up to its host.</summary>
+        /// to the hard ceiling. This is what the seat array, invite gate and UI use, so a client adapts up to its host.</summary>
         internal static int EffectiveCap => Math.Min(HardMax, Math.Max(Capacity, _hostCap));
+
+        /// <summary>The Steam id of the lobby we are currently in, or 0. Lobby.LobbyID exists in 0.4.6f11 but the
+        /// game never assigns it, so it is always 0 - the real id lives in SteamLobbyService._lobbyID.</summary>
+        internal static ulong CurrentLobbyId
+        {
+            get
+            {
+                try { var s = Service(); return s != null ? s._lobbyID : 0UL; }
+                catch { return 0UL; }
+            }
+        }
+
+        /// <summary>How many seats the game's lobby service actually holds right now, or 0 when there is no Steam
+        /// lobby service. This is the ground truth a host should size a session by - it reflects whatever every
+        /// loaded cap mod has grown the array to, not just our own setting.</summary>
+        internal static int SeatCount
+        {
+            get
+            {
+                try { var s = Service(); var p = s?._players; return p != null ? p.Length : 0; }
+                catch { return 0; }
+            }
+        }
 
         internal static void Install()
         {
@@ -120,66 +144,121 @@ namespace DooDesch.FullHouse
             }
             catch (Exception e) { MelonLogger.Warning("[FullHouse] preference registration failed: " + e.Message); }
 
-            PatchCap = Capacity;
-            if (PatchCap > SafeMax)
-                MelonLogger.Warning($"[FullHouse] capacity {PatchCap} exceeds the tested maximum of {SafeMax} - expect instability.");
+            if (Capacity > SafeMax)
+                MelonLogger.Warning($"[FullHouse] capacity {Capacity} exceeds the tested maximum of {SafeMax} - expect instability.");
 
             try
             {
                 var h = new HarmonyLib.Harmony("com.doodesch.fullhouse");
-                Patch(h, typeof(Lobby), "Start", postfix: nameof(Lobby_Start_Postfix));
-                Patch(h, typeof(Lobby), "OnLobbyCreated", postfix: nameof(Lobby_OnLobbyCreated_Postfix));
-                Patch(h, typeof(Lobby), "OnLobbyEntered", postfix: nameof(Lobby_OnLobbyEntered_Postfix));
-                Patch(h, typeof(Lobby), "TryOpenInviteInterface", transpiler: nameof(CapLiteralTranspiler));
-                Patch(h, typeof(LobbyInterface), "UpdateButtons", transpiler: nameof(CapLiteralTranspiler));
-                Patch(h, typeof(LobbyInterface), "Awake", postfix: nameof(LobbyInterface_Awake_Postfix));
-                Patch(h, typeof(LobbyInterface), "UpdatePlayers", prefix: nameof(LobbyInterface_UpdatePlayers_Prefix));
-                MelonLogger.Msg($"[FullHouse] active - lobby cap raised to {PatchCap}.");
+                Patch(h, typeof(SteamLobbyService), "Initialize", postfix: nameof(Service_Initialize_Postfix));
+                Patch(h, typeof(SteamLobbyService), "UpdateLobbyMembers", prefix: nameof(Service_UpdateLobbyMembers_Prefix));
+                Patch(h, typeof(SteamLobbyService), "CreateLobby", prefix: nameof(Service_CreateLobby_Prefix));
+                Patch(h, typeof(SteamLobbyService), "OnLobbyCreated", postfix: nameof(Service_OnLobbyCreated_Postfix));
+                Patch(h, typeof(SteamLobbyService), "OnLobbyEntered", postfix: nameof(Service_OnLobbyEntered_Postfix));
+                Patch(h, typeof(SteamLobbyService), "OpenInviteUI", prefix: nameof(Service_OpenInviteUI_Prefix));
+                Patch(h, typeof(LobbyInterface), "Start", postfix: nameof(LobbyInterface_Start_Postfix));
+                Patch(h, typeof(LobbyInterface), "UpdateUI", postfix: nameof(LobbyInterface_UpdateUI_Postfix));
+                Patch(h, typeof(LobbyInterface), "UpdateButtons", postfix: nameof(LobbyInterface_UpdateButtons_Postfix));
+                MelonLogger.Msg($"[FullHouse] active - lobby cap raised to {Capacity}.");
             }
             catch (Exception e) { MelonLogger.Error("[FullHouse] patch install failed: " + e); }
         }
 
         private static void Patch(HarmonyLib.Harmony h, Type type, string method,
-            string prefix = null, string postfix = null, string transpiler = null)
+            string prefix = null, string postfix = null)
         {
             var target = AccessTools.Method(type, method);
             if (target == null) { MelonLogger.Warning($"[FullHouse] {type.Name}.{method} not found - skipped."); return; }
-            h.Patch(target, prefix: Hook(prefix), postfix: Hook(postfix), transpiler: Hook(transpiler));
+            h.Patch(target, prefix: Hook(prefix), postfix: Hook(postfix));
         }
 
         private static HarmonyMethod Hook(string name) =>
             name == null ? null : new HarmonyMethod(typeof(Lobbies).GetMethod(name, AccessTools.all));
 
-        // ---- seat array + Steam member limit ------------------------------------------------------------
-
-        private static void Lobby_Start_Postfix(Lobby __instance) => GrowPlayers(__instance, EffectiveCap);
-
-        /// <summary>Grow the fixed Lobby.Players array to <paramref name="target"/>. Idempotent and additive: only
-        /// ever grows (so it never fights another cap mod or a host running a bigger lobby), and Array.Copy preserves
-        /// the existing members - keeping the host at index 0 (Lobby.IsHost reads Players[0]).</summary>
-        internal static void GrowPlayers(Lobby lobby, int target)
+        /// <summary>The live Steam lobby service, or null when Steam is down (the game then runs MockLobbyService,
+        /// which has no seat array, no member limit and no invite UI - nothing for us to raise).</summary>
+        private static SteamLobbyService Service()
         {
             try
             {
-                if (lobby == null || lobby.Players == null) return;
-                if (lobby.Players.Length >= target) return;
-                var grown = new CSteamID[target];
-                Array.Copy(lobby.Players, grown, Math.Min(lobby.Players.Length, target));
-                lobby.Players = grown;
+                var lobby = Singleton<Lobby>.Instance;
+                var svc = lobby?._lobbyService;
+                if (svc == null) return null;
+#if IL2CPP
+                return svc.TryCast<SteamLobbyService>();
+#else
+                return svc as SteamLobbyService;
+#endif
             }
-            catch (Exception e) { MelonLogger.Warning("[FullHouse] resizing Lobby.Players failed: " + e.Message); }
+            catch { return null; }
         }
 
-        /// <summary>After the lobby exists, raise the Steam member limit to the cap (the SOTA path - never replace
-        /// CreateLobby). Only ever raises, so a host that deliberately set a smaller per-lobby limit afterwards
-        /// (e.g. SideHustle's host slider) still wins.</summary>
-        private static void Lobby_OnLobbyCreated_Postfix(LobbyCreated_t result)
+        // ---- seat array ---------------------------------------------------------------------------------
+
+        /// <summary>Grow SteamLobbyService's fixed seat array to <paramref name="target"/>. Idempotent and additive:
+        /// only ever grows (so it never fights another cap mod or a host running a bigger lobby), and the copy
+        /// preserves existing members - keeping the host at index 0, which is what IsHost reads.</summary>
+        private static void EnsurePlayers(SteamLobbyService svc, int target)
+        {
+            try
+            {
+                if (svc == null || target < 2) return;
+                var cur = svc._players;
+                int have = cur != null ? cur.Length : 0;
+                if (have >= target) return;
+#if IL2CPP
+                var grown = new Il2CppStructArray<CSteamID>(target);
+#else
+                var grown = new CSteamID[target];
+#endif
+                for (int i = 0; i < have; i++) grown[i] = cur[i];
+                svc._players = grown;
+            }
+            catch (Exception e) { MelonLogger.Warning("[FullHouse] resizing the lobby seat array failed: " + e.Message); }
+        }
+
+        private static void Service_Initialize_Postfix(SteamLobbyService __instance) => EnsurePlayers(__instance, EffectiveCap);
+
+        /// <summary>UpdateLobbyMembers writes <c>_players[j]</c> for every Steam lobby member with no bounds check,
+        /// so a fifth member throws IndexOutOfRange inside a Steam callback and takes the session down. This is the
+        /// only writer of the array, so guarding here is both sufficient and always in time. Size to the real member
+        /// count as well as the cap, in case we joined a lobby larger than our own setting before adopting its cap.</summary>
+        private static void Service_UpdateLobbyMembers_Prefix(SteamLobbyService __instance)
+        {
+            try
+            {
+                int members = 0;
+                try
+                {
+                    ulong id = __instance != null ? __instance._lobbyID : 0UL;
+                    if (id != 0UL) members = SteamMatchmaking.GetNumLobbyMembers(new CSteamID(id));
+                }
+                catch { }
+                EnsurePlayers(__instance, Math.Max(EffectiveCap, members));
+            }
+            catch (Exception e) { MelonLogger.Warning("[FullHouse] seat guard failed: " + e.Message); }
+        }
+
+        // ---- Steam member limit -------------------------------------------------------------------------
+
+        /// <summary>Lobby.CreateLobby() asks for a hard-coded 4. Raise the request itself rather than replacing the
+        /// call, so the lobby is born at the right size instead of being resized a frame later. Only ever raises.</summary>
+        private static void Service_CreateLobby_Prefix(ref int maxPlayers)
+        {
+            int cap = EffectiveCap;
+            if (maxPlayers < cap) maxPlayers = cap;
+        }
+
+        /// <summary>After the lobby exists, raise the Steam member limit to the cap (never replace CreateLobby).
+        /// Only ever raises, so a host that deliberately set a smaller per-lobby limit afterwards (e.g. SideHustle's
+        /// host slider) still wins.</summary>
+        private static void Service_OnLobbyCreated_Postfix(LobbyCreated_t result)
         {
             try
             {
                 if (result.m_eResult != EResult.k_EResultOK) return;
                 CSteamID sid = (CSteamID)result.m_ulSteamIDLobby;
-                int cap = Capacity;
+                int cap = EffectiveCap;
                 if (SteamMatchmaking.GetLobbyMemberLimit(sid) < cap)
                     SteamMatchmaking.SetLobbyMemberLimit(sid, cap);
                 // Advertise the limit Steam actually accepted, not the requested one: if SetLobbyMemberLimit was
@@ -195,21 +274,21 @@ namespace DooDesch.FullHouse
 
         /// <summary>Client-side host sync: on entering a lobby, adopt the host's advertised cap (the "max_players"
         /// lobby data the host writes in OnLobbyCreated) so a client configured smaller than the host still seats
-        /// everyone the host admits - preventing the Players[] overflow. Grows the array, the invite-gate value and
-        /// the UI to the new effective cap. Only ever grows; runs on the host too (adopts its own value, a no-op).</summary>
-        private static void Lobby_OnLobbyEntered_Postfix(LobbyEnter_t result)
+        /// everyone the host admits. Grows the seat array and the UI to the new effective cap. Only ever grows; runs
+        /// on the host too (adopts its own value, a no-op). Vanilla bails out of OnLobbyEntered on a version mismatch
+        /// AFTER calling LeaveLobby, and this postfix still runs - hence the "did we actually stay" check.</summary>
+        private static void Service_OnLobbyEntered_Postfix(SteamLobbyService __instance, LobbyEnter_t result)
         {
             try
             {
+                if (__instance == null || __instance._lobbyID == 0UL) return;   // bounced (version mismatch) - nothing joined
                 CSteamID sid = (CSteamID)result.m_ulSteamIDLobby;
                 int hostCap = 0;
                 int.TryParse(SteamMatchmaking.GetLobbyData(sid, "max_players"), out hostCap);
                 if (hostCap <= _hostCap) return;               // nothing new to adopt
                 _hostCap = hostCap;
                 int target = EffectiveCap;
-                if (target > PatchCap) PatchCap = target;      // keep the invite-gate transpiler in step
-                var lobby = Singleton<Lobby>.Instance;
-                if (lobby != null) GrowPlayers(lobby, target); // the array must fit before UpdateLobbyMembers runs
+                EnsurePlayers(__instance, target);             // the array must fit before the next member update runs
                 EnsureSlots(Singleton<LobbyInterface>.Instance, target);
                 MelonLogger.Msg($"[FullHouse] adopted host lobby cap {target}.");
             }
@@ -218,146 +297,131 @@ namespace DooDesch.FullHouse
 
         // ---- invite gate --------------------------------------------------------------------------------
 
-        /// <summary>Replace the single literal 4 (the "&gt;= 4" / "&lt; 4" capacity check) with the configured cap.
-        /// Only applied to TryOpenInviteInterface and UpdateButtons, whose sole 4 IS the cap - never blanket-applied
-        /// (LobbyInterface's avatar RGBA math also uses a literal 4). A transpiler (not a prefix-skip) so it composes
-        /// with another cap mod's prefix instead of double-handling the invite.</summary>
-        private static IEnumerable<CodeInstruction> CapLiteralTranspiler(IEnumerable<CodeInstruction> instructions)
+        /// <summary>Vanilla OpenInviteUI refuses to open the Steam overlay once the lobby holds 4 members - a
+        /// hard-coded literal, and under IL2CPP there is no IL to transpile. Replace the method with the same body
+        /// measured against the effective cap. Mirrors vanilla exactly otherwise, including the fire-and-forget
+        /// CreateLobby when we are not in a lobby yet (which our CreateLobby prefix sizes correctly).</summary>
+        private static bool Service_OpenInviteUI_Prefix(SteamLobbyService __instance)
         {
-            var capField = AccessTools.Field(typeof(Lobbies), nameof(PatchCap));
-            foreach (var ins in instructions)
+            try
             {
-                if (ins.opcode == OpCodes.Ldc_I4_4)
-                    yield return new CodeInstruction(OpCodes.Ldsfld, capField);
-                else
-                    yield return ins;
+                if (__instance == null) return true;
+                if (__instance._lobbyID == 0UL) { __instance.CreateLobby(EffectiveCap); return false; }
+                CSteamID sid = new CSteamID(__instance._lobbyID);
+                if (SteamMatchmaking.GetNumLobbyMembers(sid) >= EffectiveCap)
+                {
+                    MelonLogger.Warning("[FullHouse] lobby already at max capacity.");
+                    return false;
+                }
+                SteamFriends.ActivateGameOverlayInviteDialog(sid);
+                return false;
+            }
+            catch (Exception e)
+            {
+                MelonLogger.Warning("[FullHouse] invite gate failed, falling back to vanilla: " + e.Message);
+                return true;
             }
         }
 
         // ---- lobby UI -----------------------------------------------------------------------------------
 
-        private static void LobbyInterface_Awake_Postfix(LobbyInterface __instance)
+        // LobbyInterface is a plain Singleton since 0.4.6f11 (it used to be a PersistentSingleton), so it is rebuilt
+        // per scene and the slot cloning has to re-run for every instance. Start is that per-instance hook.
+        private static void LobbyInterface_Start_Postfix(LobbyInterface __instance)
         {
             try { MelonCoroutines.Start(BuildUi(__instance)); }
             catch (Exception e) { MelonLogger.Warning("[FullHouse] UI coroutine start failed: " + e.Message); }
         }
 
-        /// <summary>Vanilla UpdatePlayers loops <c>for i in 0..PlayerSlots.Length</c> and indexes
-        /// <c>Lobby.Players[i]</c>. Once the UI slots are grown to the cap, a join/rejoin that momentarily leaves the
-        /// seat array at the vanilla size 4 (the game reallocates it on some member changes) makes that index
-        /// overflow and throws an IndexOutOfRangeException on the IL2CPP trampoline - taking down the whole session.
-        /// Guarantee the seat array is at least as large as the UI before the vanilla loop runs. Idempotent (grows
-        /// only), and the extra slots read as CSteamID.Nil so vanilla just clears them.</summary>
-        private static void LobbyInterface_UpdatePlayers_Prefix(LobbyInterface __instance)
+        /// <summary>Vanilla UpdateUI writes the title as "Lobby (n/4)". Re-apply it with the effective cap. This runs
+        /// on every lobby change (UpdateUI is subscribed to Lobby.OnLobbyChange), which is why no separate hook on
+        /// that event is needed any more.</summary>
+        private static void LobbyInterface_UpdateUI_Postfix(LobbyInterface __instance)
         {
             try
             {
-                if (__instance?.PlayerSlots == null) return;
-                // Vanilla indexes __instance.Lobby.Players (the interface's OWN field), not the Lobby singleton, so
-                // grow exactly that array. They are normally the same object, but a stale UI instance during a
-                // leave/rejoin can still hold a lobby the singleton no longer points at (or the singleton is null);
-                // growing the singleton would then leave vanilla overflowing the array it actually reads.
-                var lobby = __instance.Lobby ?? Singleton<Lobby>.Instance;
-                if (lobby?.Players == null) return;
-                if (lobby.Players.Length < __instance.PlayerSlots.Length)
-                    GrowPlayers(lobby, __instance.PlayerSlots.Length);
+                var lobby = Singleton<Lobby>.Instance;
+                int count = lobby != null ? lobby.PlayerCount : 0;
+                if (__instance?.LobbyTitle != null)
+                    __instance.LobbyTitle.text = "Lobby (" + count + "/" + EffectiveCap + ")";
             }
-            catch (Exception e) { MelonLogger.Warning("[FullHouse] UpdatePlayers guard failed: " + e.Message); }
+            catch (Exception e) { MelonLogger.Warning("[FullHouse] title sync failed: " + e.Message); }
         }
 
-        // Set once: the Lobby singleton persists across scenes, so its onLobbyChange must be wrapped a single time.
-        private static bool _titleHooked;
+        /// <summary>Vanilla hides the invite button once PlayerCount reaches 4. Re-decide against the effective cap.
+        /// Runs at High priority so SideHustle's "any member may invite" postfix (Low) still gets the last word.</summary>
+        [HarmonyPriority(Priority.High)]
+        private static void LobbyInterface_UpdateButtons_Postfix(LobbyInterface __instance)
+        {
+            try
+            {
+                var lobby = Singleton<Lobby>.Instance;
+                if (lobby == null || __instance?.InviteButton == null) return;
+                __instance.InviteButton.gameObject.SetActive(lobby.IsHost && lobby.PlayerCount < EffectiveCap);
+            }
+            catch (Exception e) { MelonLogger.Warning("[FullHouse] invite button sync failed: " + e.Message); }
+        }
 
         /// <summary>Wait for the Lobby singleton, defensively grow the seat array, then clone the lobby's slot
-        /// template up to <c>cap</c> TOTAL slots (counting whatever is already there, so it never double-clones when
-        /// another cap mod added some), rebuild PlayerSlots, and set the "/cap" title.</summary>
+        /// template up to the effective cap.</summary>
         private static IEnumerator BuildUi(LobbyInterface ui)
         {
             while (Singleton<Lobby>.Instance == null) yield return null;
-            var lobby = Singleton<Lobby>.Instance;
-
-            GrowPlayers(lobby, EffectiveCap);   // the array must be sized before any member update runs
 
             bool steamReady = true;
             try { steamReady = SteamManager.Initialized; } catch { }
-            if (!steamReady) yield break;
+            if (!steamReady) yield break;   // MockLobbyService - no seats, no members, nothing to grow
 
+            EnsurePlayers(Service(), EffectiveCap);
             EnsureSlots(ui, EffectiveCap);
-
-            // Vanilla re-sets the title to ".../4" on every lobby change; wrap onLobbyChange ONCE to re-apply the
-            // effective cap after. The Lobby is a persistent singleton that survives scene reloads, so a per-Awake
-            // re-wrap would chain wrappers that pile up and reference destroyed UI; the single hook instead resolves
-            // the live LobbyInterface each time and reads EffectiveCap live, so a later host-cap sync corrects it too.
-            if (!_titleHooked)
-            {
-                _titleHooked = true;
-                try
-                {
-                    var prev = lobby.OnLobbyChange;
-#if IL2CPP
-                    lobby.OnLobbyChange = new System.Action(() =>
-                    {
-                        try { prev?.Invoke(); } catch { }
-                        try { var cur = Singleton<LobbyInterface>.Instance; if (cur != null) cur.LobbyTitle.text = "Lobby (" + lobby.PlayerCount + "/" + EffectiveCap + ")"; } catch { }
-                    });
-#else
-                    lobby.OnLobbyChange = () =>
-                    {
-                        try { prev?.Invoke(); } catch { }
-                        try { var cur = Singleton<LobbyInterface>.Instance; if (cur != null) cur.LobbyTitle.text = "Lobby (" + lobby.PlayerCount + "/" + EffectiveCap + ")"; } catch { }
-                    };
-#endif
-                }
-                catch (Exception e) { _titleHooked = false; MelonLogger.Warning("[FullHouse] title sync hook failed: " + e.Message); }
-            }
         }
 
         /// <summary>Clone the lobby slot template up to <paramref name="target"/> TOTAL slots (counting whatever is
-        /// already there, so it never double-clones when another cap mod or an earlier pass added some), rebuild
-        /// PlayerSlots, and set the "/target" title. Idempotent - safe to call again when the effective cap grows
-        /// (e.g. a client adopting a bigger host cap).</summary>
+        /// already there, so it never double-clones when another cap mod or an earlier pass added some) and rebuild
+        /// PlayerSlots. Idempotent - safe to call again when the effective cap grows (e.g. a client adopting a bigger
+        /// host cap). Clones PlayerSlots[0] rather than a guessed child index, so every clone is guaranteed to carry
+        /// the "Frame/Avatar" child that DisplayPlayer dereferences.</summary>
         private static void EnsureSlots(LobbyInterface ui, int target)
         {
             if (ui == null) return;
-            GridLayoutGroup grid = null;
-            try { grid = ui.GetComponentInChildren<GridLayoutGroup>(); } catch { }
-            if (grid == null) { MelonLogger.Warning("[FullHouse] lobby GridLayoutGroup not found."); return; }
-
             try
             {
-                var entries = grid.transform;
-                // Children: [0] = invite button, [1..] = player slots. Clone slot[1] as the template up to `target`.
-                if (entries.childCount > 1)
+                var slots = ui.PlayerSlots;
+                if (slots == null || slots.Length == 0) { MelonLogger.Warning("[FullHouse] lobby PlayerSlots not found."); return; }
+                int have = slots.Length;
+                if (have >= target)
                 {
-                    var template = entries.GetChild(1);
-                    for (int have = entries.childCount - 1; have < target; have++)
-                    {
-                        var clone = UnityEngine.Object.Instantiate(template.gameObject, entries);
-                        clone.name = template.gameObject.name + " (" + (entries.childCount - 2) + ")";
-                    }
-
-                    int slotCount = entries.childCount - 1;
-                    var slots = new RectTransform[slotCount];
-                    for (int j = 1; j < entries.childCount; j++)
-                        slots[j - 1] = entries.GetChild(j).GetComponent<RectTransform>();
-                    ui.PlayerSlots = slots;
+                    RefreshPlayers(ui);
+                    return;
                 }
-                var lobby = Singleton<Lobby>.Instance;
-                int count = lobby != null ? lobby.PlayerCount : 0;
-                ui.LobbyTitle.text = "Lobby (" + count + "/" + target + ")";
+
+                var template = slots[have - 1];
+                var parent = template.parent;
+                var grown = new RectTransform[target];
+                for (int i = 0; i < have; i++) grown[i] = slots[i];
+                for (int i = have; i < target; i++)
+                {
+                    var clone = UnityEngine.Object.Instantiate(template.gameObject, parent, false);
+                    clone.name = template.gameObject.name + " (" + i + ")";
+                    grown[i] = clone.GetComponent<RectTransform>();
+                }
+                ui.PlayerSlots = grown;
 
                 // A freshly-cloned slot defaults to ACTIVE. Vanilla only hides an empty seat inside UpdatePlayers
                 // (ClearPlayer -> SetActive(false)), and that only re-runs on a lobby change - so when the panel opens
-                // with members already seated, the new empty clones would linger as a blank strip across the top.
-                // Refresh once now; the Players array was grown first (BuildUi + the UpdatePlayers prefix), so the
-                // vanilla loop covers every slot instead of overflowing at index 4 and leaving the rest visible.
-#if IL2CPP
-                try { ui.UpdatePlayers(); } catch { }
-#else
-                try { AccessTools.Method(typeof(LobbyInterface), "UpdatePlayers")?.Invoke(ui, null); } catch { }
-#endif
+                // with members already seated, the new empty clones would linger as a blank strip. Refresh once now.
+                RefreshPlayers(ui);
             }
             catch (Exception e) { MelonLogger.Warning("[FullHouse] building lobby UI failed: " + e.Message); }
+        }
+
+        private static void RefreshPlayers(LobbyInterface ui)
+        {
+#if IL2CPP
+            try { ui.UpdatePlayers(); } catch { }
+#else
+            try { AccessTools.Method(typeof(LobbyInterface), "UpdatePlayers")?.Invoke(ui, null); } catch { }
+#endif
         }
     }
 }
