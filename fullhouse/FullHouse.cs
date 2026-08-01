@@ -84,7 +84,9 @@ namespace DooDesch.FullHouse
         }
 
         /// <summary>The host's advertised cap, learned from the lobby's "max_players" data when we join. Lets a
-        /// client configured smaller than the host still seat everyone the host admits. Only ever grows.</summary>
+        /// client configured smaller than the host still seat everyone the host admits. Only ever grows WITHIN a
+        /// lobby, and is dropped when we leave - otherwise one visit to a 32-seat lobby would keep raising the cap of
+        /// every later lobby we host ourselves.</summary>
         private static int _hostCap;
 
         /// <summary>The cap actually applied on this client - the larger of our own setting and the host's, clamped
@@ -156,6 +158,7 @@ namespace DooDesch.FullHouse
                 Patch(h, typeof(SteamLobbyService), "OnLobbyCreated", postfix: nameof(Service_OnLobbyCreated_Postfix));
                 Patch(h, typeof(SteamLobbyService), "OnLobbyEntered", postfix: nameof(Service_OnLobbyEntered_Postfix));
                 Patch(h, typeof(SteamLobbyService), "OpenInviteUI", prefix: nameof(Service_OpenInviteUI_Prefix));
+                Patch(h, typeof(SteamLobbyService), "LeaveLobby", postfix: nameof(Service_LeaveLobby_Postfix));
                 Patch(h, typeof(LobbyInterface), "Start", postfix: nameof(LobbyInterface_Start_Postfix));
                 Patch(h, typeof(LobbyInterface), "UpdateUI", postfix: nameof(LobbyInterface_UpdateUI_Postfix));
                 Patch(h, typeof(LobbyInterface), "UpdateButtons", postfix: nameof(LobbyInterface_UpdateButtons_Postfix));
@@ -285,7 +288,17 @@ namespace DooDesch.FullHouse
                 CSteamID sid = (CSteamID)result.m_ulSteamIDLobby;
                 int hostCap = 0;
                 int.TryParse(SteamMatchmaking.GetLobbyData(sid, "max_players"), out hostCap);
+
+                // "max_players" is just a string the host wrote - it is not authority. Believe Steam instead: the real
+                // member limit is what the lobby will actually admit, and it bounds how many seats and UI slots are
+                // worth building. Without this a host advertising 250 would have every client allocate 250 seats and
+                // clone ~246 lobby rows for members Steam would never let in.
+                int steamLimit = SteamMatchmaking.GetLobbyMemberLimit(sid);
+                if (steamLimit > 0 && hostCap > steamLimit) hostCap = steamLimit;
+
                 if (hostCap <= _hostCap) return;               // nothing new to adopt
+                if (hostCap > SafeMax)
+                    MelonLogger.Warning($"[FullHouse] this lobby seats {hostCap}, past the tested maximum of {SafeMax} - expect instability.");
                 _hostCap = hostCap;
                 int target = EffectiveCap;
                 EnsurePlayers(__instance, target);             // the array must fit before the next member update runs
@@ -293,6 +306,16 @@ namespace DooDesch.FullHouse
                 MelonLogger.Msg($"[FullHouse] adopted host lobby cap {target}.");
             }
             catch (Exception e) { MelonLogger.Warning("[FullHouse] host-cap sync failed: " + e.Message); }
+        }
+
+        /// <summary>Leaving a lobby drops the host's cap again. Without this, one visit to a 32-seat lobby would keep
+        /// raising the seat count, the invite gate and the UI of every lobby we host afterwards - the adoption is
+        /// meant to last as long as we are in THAT host's lobby, not for the rest of the session.</summary>
+        private static void Service_LeaveLobby_Postfix()
+        {
+            if (_hostCap == 0) return;
+            _hostCap = 0;
+            MelonLogger.Msg($"[FullHouse] left the lobby - back to the local cap of {Capacity}.");
         }
 
         // ---- invite gate --------------------------------------------------------------------------------
@@ -308,9 +331,17 @@ namespace DooDesch.FullHouse
                 if (__instance == null) return true;
                 if (__instance._lobbyID == 0UL) { __instance.CreateLobby(EffectiveCap); return false; }
                 CSteamID sid = new CSteamID(__instance._lobbyID);
-                if (SteamMatchmaking.GetNumLobbyMembers(sid) >= EffectiveCap)
+
+                // Gate on whichever is smaller: our cap, or the limit Steam actually holds this lobby to. They differ
+                // whenever Steam refused the resize, or a host lowered the per-lobby limit afterwards - and inviting
+                // past the real limit only produces invitations Steam will not admit.
+                int gate = EffectiveCap;
+                int steamLimit = SteamMatchmaking.GetLobbyMemberLimit(sid);
+                if (steamLimit > 0 && steamLimit < gate) gate = steamLimit;
+
+                if (SteamMatchmaking.GetNumLobbyMembers(sid) >= gate)
                 {
-                    MelonLogger.Warning("[FullHouse] lobby already at max capacity.");
+                    MelonLogger.Warning($"[FullHouse] lobby already at max capacity ({gate}).");
                     return false;
                 }
                 SteamFriends.ActivateGameOverlayInviteDialog(sid);
