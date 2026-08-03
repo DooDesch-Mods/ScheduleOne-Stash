@@ -13,7 +13,9 @@
 //     bounds check, so member #5 would throw IndexOutOfRange inside a Steam callback),
 //   - raise the requested member count in CreateLobby and again post-creation via SetLobbyMemberLimit,
 //   - replace the invite gate, whose "already at max capacity" check is a hard-coded 4,
-//   - clone the lobby UI slots and keep the "/N" title and the invite button in sync.
+//   - clone the lobby UI slots and keep the "/N" title and the invite button in sync,
+//   - raise the NETWORK TRANSPORT's own client limit, which is a separate cap from the lobby's: seats
+//     the transport will not accept are seats players can occupy in the lobby but never connect into.
 // All patches are idempotent and additive (only ever grow, never skip the original), so it coexists with
 // other cap mods (e.g. BiggerLobbies): the highest cap wins and nothing conflicts. A named-GameObject
 // single-flight guard means only one loaded copy installs the patches.
@@ -31,11 +33,14 @@ using Il2CppScheduleOne.DevUtilities;
 using Il2CppSteamworks;
 using Il2Cpp;                       // SteamManager (global-namespace Steamworks.NET helper)
 using Il2CppInterop.Runtime.InteropTypes.Arrays;
+// The transport type's name equals its namespace, so alias it rather than fight the ambiguity.
+using FishyTransport = Il2CppFishySteamworks.FishySteamworks;
 #else
 using ScheduleOne.Networking;
 using ScheduleOne.UI.Multiplayer;
 using ScheduleOne.DevUtilities;
 using Steamworks;
+using FishyTransport = FishySteamworks.FishySteamworks;
 #endif
 using System;
 using System.Collections;
@@ -45,7 +50,7 @@ using MelonLoader;
 using UnityEngine;
 
 #if FULLHOUSE_STANDALONE
-[assembly: MelonInfo(typeof(DooDesch.FullHouse.Core), "FullHouse", "1.0.0", "DooDesch", "https://github.com/DooDesch-Mods/ScheduleOne-FullHouse")]
+[assembly: MelonInfo(typeof(DooDesch.FullHouse.Core), "FullHouse", "1.1.0", "DooDesch", "https://github.com/DooDesch-Mods/ScheduleOne-FullHouse")]
 [assembly: MelonGame("TVGS", "Schedule I")]
 #endif
 
@@ -220,7 +225,40 @@ namespace DooDesch.FullHouse
             catch (Exception e) { MelonLogger.Warning("[FullHouse] resizing the lobby seat array failed: " + e.Message); }
         }
 
-        private static void Service_Initialize_Postfix(SteamLobbyService __instance) => EnsurePlayers(__instance, EffectiveCap);
+        private static void Service_Initialize_Postfix(SteamLobbyService __instance)
+        {
+            EnsurePlayers(__instance, EffectiveCap);
+            RaiseTransportCap();   // earliest point the transport usually exists; OnLobbyCreated repeats it
+        }
+
+        // ---- the network transport's own client limit ----------------------------------------------------
+
+        /// <summary>
+        /// Raise the network transport's client limit to match the lobby cap. Seats in the Steam lobby are only
+        /// half the story - the transport keeps its own limit, and a lobby with more seats than the transport
+        /// accepts is one that players can enter but not connect into.
+        /// <para>
+        /// Written as a plain field assignment, called from hooks that already run before a session starts.
+        /// Do NOT Harmony-patch <c>FishySteamworks.StartConnection</c> to do this instead: a detour on that
+        /// method terminates the process with an access violation (0xc0000005) the moment the server starts,
+        /// regardless of what the patch body does. Setting the field beforehand is enough, because
+        /// StartConnection reads it when it runs.
+        /// </para>
+        /// </summary>
+        private static void RaiseTransportCap()
+        {
+            try
+            {
+                var fishy = UnityEngine.Object.FindObjectOfType<FishyTransport>();
+                if (fishy == null) return;                    // transport not spawned yet - a later call gets it
+                int cap = EffectiveCap;
+                ushort had = fishy._maximumClients;
+                if (had >= cap) return;                       // already raised (or another cap mod got there first)
+                fishy._maximumClients = (ushort)cap;
+                MelonLogger.Msg($"[FullHouse] transport client limit {had} -> {cap}.");
+            }
+            catch (Exception e) { MelonLogger.Warning("[FullHouse] raising the transport client limit failed: " + e.Message); }
+        }
 
         /// <summary>UpdateLobbyMembers writes <c>_players[j]</c> for every Steam lobby member with no bounds check,
         /// so a fifth member throws IndexOutOfRange inside a Steam callback and takes the session down. This is the
@@ -260,6 +298,7 @@ namespace DooDesch.FullHouse
             try
             {
                 if (result.m_eResult != EResult.k_EResultOK) return;
+                RaiseTransportCap();   // we are about to host: the transport must accept as many as the lobby seats
                 CSteamID sid = (CSteamID)result.m_ulSteamIDLobby;
                 int cap = EffectiveCap;
                 if (SteamMatchmaking.GetLobbyMemberLimit(sid) < cap)
