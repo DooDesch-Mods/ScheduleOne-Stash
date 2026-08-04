@@ -1,0 +1,60 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Nudge - the standalone build of the shared update check (Nudge.cs, right next to this file).
+    Produces one small Nudge.dll a player drops into Mods/: it then reports every installed mod that has a
+    newer GitHub release, with nothing to compile and no other mod required.
+
+    The same source is embedded into host mods via ../build/Nudge.props - NUDGE_STANDALONE (set only here)
+    is what turns the MelonMod entry point on. Both can be installed at once; a runtime single-flight guard
+    means only one of them does the work.
+
+    Needs only MelonLoader - no Harmony, no S1API, no game assemblies, no Unity. Contributors run
+    ../tools/copy-game-libs.ps1 to fill ../lib, or point -p:WorkspaceLibPath at their own.
+
+      dotnet build Nudge.csproj -c Release
+  -->
+
+  <PropertyGroup>
+    <TargetFramework>net6.0</TargetFramework>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <Nullable>disable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <IsPackable>false</IsPackable>
+    <RootNamespace>DooDesch.Nudge</RootNamespace>
+    <AssemblyName>Nudge</AssemblyName>
+    <NeutralLanguage>en-US</NeutralLanguage>
+    <Version>1.0.0</Version>
+    <AssemblyVersion>1.0.0.0</AssemblyVersion>
+    <FileVersion>1.0.0.0</FileVersion>
+    <NoWarn>$(NoWarn);MSB3277;MSB3245</NoWarn>
+    <DefineConstants>$(DefineConstants);NUDGE_STANDALONE</DefineConstants>
+
+    <!-- Release hardening: no debug info and no assembly identity in the shipped DLL - a bare MelonLoader mod
+         with an HTTP call is exactly the shape antivirus heuristics flag, and this cuts the false positives. -->
+    <DebugType>none</DebugType>
+    <DebugSymbols>false</DebugSymbols>
+    <GenerateAssemblyInfo>true</GenerateAssemblyInfo>
+    <Deterministic>true</Deterministic>
+
+    <!-- The maintainer builds against the private Workspace lib; a contributor runs tools/copy-game-libs.ps1
+         and gets ../lib. Prefer Workspace when present. Override with -p:WorkspaceLibPath=... -->
+    <WorkspaceLibPath Condition="'$(WorkspaceLibPath)' == '' and Exists('$(MSBuildThisFileDirectory)../../Workspace/lib')">$(MSBuildThisFileDirectory)../../Workspace/lib</WorkspaceLibPath>
+    <WorkspaceLibPath Condition="'$(WorkspaceLibPath)' == ''">$(MSBuildThisFileDirectory)../lib</WorkspaceLibPath>
+    <MelonLoaderPath>$(WorkspaceLibPath)/il2cpp/melonloader</MelonLoaderPath>
+  </PropertyGroup>
+
+  <!-- Only Nudge.cs. The SDK's default glob would also sweep in every sibling folder of the Stash repo. -->
+  <ItemGroup>
+    <Compile Remove="**/*.cs" />
+    <Compile Include="Nudge.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Reference Include="MelonLoader">
+      <HintPath>$(MelonLoaderPath)/MelonLoader.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+
+</Project>

@@ -1,0 +1,35 @@
+<Project>
+
+  <!--
+    Nudge.props - shared update check (namespace DooDesch.Nudge) for Schedule I MelonLoader mods.
+    Lives in the public Stash repo (github.com/DooDesch-Mods/ScheduleOne-Stash).
+
+    A mod opts in with EXACTLY ONE line - IMPORTANT: place it AFTER the mod's <Compile Remove="Stash/**/*.cs" />
+    ItemGroup (CI checks the Stash out as a subfolder, so without the Remove the SDK glob would double-include
+    the file this props adds):
+        <Import Project="$(MSBuildThisFileDirectory)../Stash/build/Nudge.props"
+                Condition="Exists('$(MSBuildThisFileDirectory)../Stash/build/Nudge.props')" />
+
+    Usage in the host mod: call DooDesch.Nudge.Nudge.Watch() once in OnInitializeMelon. It checks EVERY
+    loaded mod, not just the host - MelonLoader already knows each mod's version and download link, so any
+    mod declaring a github.com repo as its 5th MelonInfo argument is covered. One consumer is enough for a
+    whole install; further copies stand down at runtime.
+
+    The class is INTERNAL and compiled into each consumer assembly separately, so there is NO CS0436 risk even
+    when one consumer references another consumer's DLL. It needs only MelonLoader and the BCL - no Harmony,
+    no S1API, no Unity, no game types - and is identical for IL2CPP and Mono.
+
+    Thunderstore builds (-p:StoreBuild=thunderstore) get NO_EXTERNAL_FETCH below, which compiles the endpoint,
+    the HTTP client and the parser out of the shipped DLL and leaves Watch() a no-op. That keeps a store build
+    free of any outbound URL, which the release workflows check for.
+  -->
+
+  <PropertyGroup Condition="'$(StoreBuild)' == 'thunderstore'">
+    <DefineConstants>$(DefineConstants);NO_EXTERNAL_FETCH</DefineConstants>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="$(MSBuildThisFileDirectory)..\nudge\Nudge.cs" Link="Nudge\Nudge.cs" />
+  </ItemGroup>
+
+</Project>
